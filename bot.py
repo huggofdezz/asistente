@@ -70,7 +70,8 @@ def save_message(memory: dict, user_id: str, role: str, content: str):
 # ─── Cliente de IA ────────────────────────────────────────────────────────────
 def get_ai_response(conversation_history: list, memory: dict) -> str:
     """Obtiene respuesta de Claude AI"""
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+import httpx
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, http_client=httpx.Client())
     
     # Contexto con toda la info del usuario
     tasks_str = "\n".join([f"- {'✅' if t.get('done') else '⬜'} {t['text']}" for t in memory["tasks"][-10:]]) or "Sin tareas"
