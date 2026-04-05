@@ -12,13 +12,17 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
 )
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 import anthropic
+import pytz
 
 # ─── Configuración ────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 MEMORY_FILE = "memory.json"
 YOUR_TELEGRAM_ID = os.environ.get("YOUR_TELEGRAM_ID", "")
+TIMEZONE = "Europe/Madrid"
 
 # ─── Sistema de Memoria ───────────────────────────────────────────────────────
 def load_memory() -> dict:
@@ -33,7 +37,7 @@ def load_memory() -> dict:
         "preferences": {
             "nombre_usuario": "amigo",
             "idioma": "español",
-            "zona_horaria": "Europe/Madrid"
+            "zona_horaria": TIMEZONE
         }
     }
 
@@ -63,7 +67,6 @@ def get_ai_response(conversation_history: list, memory: dict) -> str:
 
     tasks_str = "\n".join([f"- {'✅' if t.get('done') else '⬜'} {t['text']}" for t in memory["tasks"][-10:]]) or "Sin tareas"
     notes_str = "\n".join([f"- {n['text']}" for n in memory["notes"][-5:]]) or "Sin notas"
-
     today = datetime.now().strftime("%Y-%m-%d")
     habits_today = memory["habits"].get(today, {})
 
@@ -81,12 +84,6 @@ Eres inteligente, proactivo, y hablas siempre en español de manera natural y ce
 ✅ HÁBITOS DE HOY:
 {json.dumps(habits_today, ensure_ascii=False) if habits_today else "Ninguno registrado aún"}
 
-🎯 TUS CAPACIDADES:
-- Gestión de tareas: puedes añadir, marcar como hechas o borrar tareas
-- Notas rápidas: guardar cualquier información importante
-- Seguimiento de hábitos: registrar actividades diarias
-- Conversación inteligente: responder preguntas, ayudar a pensar, dar consejos
-
 🔧 COMANDOS QUE PUEDES EJECUTAR (inclúyelos en tu respuesta cuando sea apropiado):
 - Para añadir tarea: [TAREA: descripción]
 - Para completar tarea: [COMPLETAR_TAREA: número]
@@ -97,10 +94,7 @@ Responde de forma concisa y útil. Máximo 3-4 párrafos salvo que te pidan más
 
     messages = []
     for msg in conversation_history[-10:]:
-        messages.append({
-            "role": msg["role"],
-            "content": msg["content"]
-        })
+        messages.append({"role": msg["role"], "content": msg["content"]})
 
     response = client.messages.create(
         model="claude-haiku-4-5",
@@ -112,16 +106,26 @@ Responde de forma concisa y útil. Máximo 3-4 párrafos salvo que te pidan más
     http_client.close()
     return response.content[0].text
 
+def get_morning_phrase() -> str:
+    http_client = httpx.Client()
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, http_client=http_client)
+    response = client.messages.create(
+        model="claude-haiku-4-5",
+        max_tokens=150,
+        messages=[{
+            "role": "user",
+            "content": "Dame UNA frase motivadora corta y original para empezar el día. En español, inspiradora y diferente cada vez. Solo la frase, sin comillas ni explicaciones."
+        }]
+    )
+    http_client.close()
+    return response.content[0].text.strip()
+
 def process_ai_commands(response_text: str, memory: dict) -> str:
     import re
 
     tarea_matches = re.findall(r'\[TAREA: ([^\]]+)\]', response_text)
     for tarea in tarea_matches:
-        memory["tasks"].append({
-            "text": tarea,
-            "done": False,
-            "created": datetime.now().isoformat()
-        })
+        memory["tasks"].append({"text": tarea, "done": False, "created": datetime.now().isoformat()})
         response_text = response_text.replace(f'[TAREA: {tarea}]', f'📌 _{tarea}_ añadida a tareas')
 
     completar_matches = re.findall(r'\[COMPLETAR_TAREA: (\d+)\]', response_text)
@@ -136,10 +140,7 @@ def process_ai_commands(response_text: str, memory: dict) -> str:
 
     nota_matches = re.findall(r'\[NOTA: ([^\]]+)\]', response_text)
     for nota in nota_matches:
-        memory["notes"].append({
-            "text": nota,
-            "created": datetime.now().isoformat()
-        })
+        memory["notes"].append({"text": nota, "created": datetime.now().isoformat()})
         response_text = response_text.replace(f'[NOTA: {nota}]', f'📝 _Nota guardada_')
 
     habito_matches = re.findall(r'\[HABITO: ([^\]]+)\]', response_text)
@@ -155,52 +156,77 @@ def process_ai_commands(response_text: str, memory: dict) -> str:
 
     return response_text
 
-# ─── Verificación de usuario ──────────────────────────────────────────────────
+# ─── Verificación ────────────────────────────────────────────────────────────
 def is_authorized(update: Update) -> bool:
     if not YOUR_TELEGRAM_ID:
         return True
     return str(update.effective_user.id) == YOUR_TELEGRAM_ID
 
-# ─── Comandos del Bot ─────────────────────────────────────────────────────────
+# ─── Recordatorio matutino ────────────────────────────────────────────────────
+async def morning_reminder(app: Application):
+    if not YOUR_TELEGRAM_ID:
+        print("⚠️ No hay YOUR_TELEGRAM_ID configurado.")
+        return
+    try:
+        memory = load_memory()
+        pendientes = [t for t in memory["tasks"] if not t.get("done")]
+        nombre = memory["preferences"].get("nombre_usuario", "amigo")
+        frase = get_morning_phrase()
+        ahora = datetime.now(pytz.timezone(TIMEZONE))
+
+        msg = f"🌅 *¡Buenos días, {nombre}!*\n"
+        msg += f"_{ahora.strftime('%A %d de %B').capitalize()}_\n\n"
+        msg += f"✨ _{frase}_\n\n"
+
+        if pendientes:
+            msg += f"📋 *Tienes {len(pendientes)} tarea(s) pendiente(s):*\n"
+            for i, t in enumerate(pendientes[:10], 1):
+                msg += f"  {i}. ⬜ {t['text']}\n"
+        else:
+            msg += "✅ *¡No tienes tareas pendientes!* Tienes el día libre 🎉\n"
+
+        msg += "\n¡A por el día! 💪"
+
+        await app.bot.send_message(chat_id=YOUR_TELEGRAM_ID, text=msg, parse_mode="Markdown")
+        print(f"✅ Recordatorio matutino enviado a las {ahora.strftime('%H:%M')}")
+    except Exception as e:
+        print(f"❌ Error en recordatorio matutino: {e}")
+
+# ─── Comandos ────────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         await update.message.reply_text("❌ No tienes acceso a este bot.")
         return
-
     keyboard = [
         [InlineKeyboardButton("📋 Ver tareas", callback_data="ver_tareas"),
          InlineKeyboardButton("📝 Ver notas", callback_data="ver_notas")],
         [InlineKeyboardButton("💪 Hábitos de hoy", callback_data="ver_habitos"),
          InlineKeyboardButton("🆘 Ayuda", callback_data="ayuda")]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
     nombre = update.effective_user.first_name
     memory = load_memory()
     memory["preferences"]["nombre_usuario"] = nombre
     save_memory(memory)
-
     await update.message.reply_text(
         f"¡Hola {nombre}! 👋 Soy tu asistente personal.\n\n"
-        f"Puedo ayudarte con:\n"
         f"• 💬 Conversar y responder preguntas\n"
         f"• 📋 Gestionar tus tareas\n"
         f"• 📝 Guardar notas\n"
-        f"• 💪 Seguir tus hábitos\n\n"
+        f"• 💪 Seguir tus hábitos\n"
+        f"• 🌅 Recordatorio cada mañana a las 7:00 AM\n\n"
         f"¡Simplemente escríbeme lo que necesitas!",
-        reply_markup=reply_markup
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 async def ver_tareas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
     memory = load_memory()
-    tasks = memory["tasks"]
-    if not tasks:
+    pendientes = [t for t in memory["tasks"] if not t.get("done")]
+    completadas = [t for t in memory["tasks"] if t.get("done")]
+    if not memory["tasks"]:
         await update.message.reply_text("No tienes tareas. ¡Dime qué añadir!")
         return
-    pendientes = [t for t in tasks if not t.get("done")]
-    completadas = [t for t in tasks if t.get("done")]
     msg = "📋 *Tus tareas:*\n\n"
     if pendientes:
         msg += "*Pendientes:*\n"
@@ -209,8 +235,7 @@ async def ver_tareas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if completadas:
         msg += f"\n*Completadas:* {len(completadas)} ✅"
     keyboard = [[InlineKeyboardButton("🗑️ Limpiar completadas", callback_data="limpiar_completadas")]]
-    await update.message.reply_text(msg, parse_mode="Markdown",
-                                     reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def ver_notas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
@@ -233,17 +258,12 @@ async def ver_habitos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = datetime.now().strftime("%Y-%m-%d")
     habits_today = memory["habits"].get(today, {})
     if not habits_today:
-        await update.message.reply_text(
-            "💪 Aún no has registrado hábitos hoy.\n"
-            "Dime algo como: _'ya hice ejercicio'_ o _'bebí 2L de agua'_",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("💪 Aún no has registrado hábitos hoy.\nDime algo como: _'ya hice ejercicio'_", parse_mode="Markdown")
         return
-    msg = f"💪 *Hábitos de hoy ({today}):*\n\n"
+    msg = f"💪 *Hábitos de hoy:*\n\n"
     for habito, hora in habits_today.items():
         msg += f"✅ {habito} — _{hora}_\n"
-    dias_con_habitos = len(memory["habits"])
-    msg += f"\n🔥 Llevas *{dias_con_habitos} días* registrando hábitos"
+    msg += f"\n🔥 Llevas *{len(memory['habits'])} días* registrando hábitos"
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -265,22 +285,20 @@ async def resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += f"  • {t['text']}\n"
     await update.message.reply_text(msg, parse_mode="Markdown")
 
-# ─── Manejador de Mensajes ────────────────────────────────────────────────────
+async def test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        return
+    await update.message.reply_text("🔔 Enviando recordatorio de prueba...")
+    await morning_reminder(context.application)
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
-
     user_id = str(update.effective_user.id)
     user_text = update.message.text
-
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id,
-        action="typing"
-    )
-
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     memory = load_memory()
     save_message(memory, user_id, "user", user_text)
-
     try:
         conversation = get_conversation(memory, user_id)
         response = get_ai_response(conversation, memory)
@@ -290,7 +308,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
-# ─── Manejador de Botones ─────────────────────────────────────────────────────
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -305,7 +322,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for i, t in enumerate(pendientes, 1):
                 msg += f"{i}. ⬜ {t['text']}\n"
             await query.message.reply_text(msg, parse_mode="Markdown")
-
     elif query.data == "ver_notas":
         notes = memory["notes"][-5:]
         if not notes:
@@ -315,7 +331,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for n in reversed(notes):
                 msg += f"• {n['text']}\n"
             await query.message.reply_text(msg, parse_mode="Markdown")
-
     elif query.data == "ver_habitos":
         today = datetime.now().strftime("%Y-%m-%d")
         habits = memory["habits"].get(today, {})
@@ -326,7 +341,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for h, hora in habits.items():
                 msg += f"✅ {h} ({hora})\n"
             await query.message.reply_text(msg, parse_mode="Markdown")
-
     elif query.data == "ayuda":
         await query.message.reply_text(
             "🆘 *Comandos disponibles:*\n\n"
@@ -334,23 +348,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/tareas — Ver tareas pendientes\n"
             "/notas — Ver notas guardadas\n"
             "/habitos — Ver hábitos de hoy\n"
-            "/resumen — Resumen del día\n\n"
-            "💬 *O simplemente escríbeme:*\n"
-            "• _'añade tarea: ir al gym'_\n"
-            "• _'anota que debo llamar al médico'_\n"
-            "• _'ya hice mis 10.000 pasos'_\n"
-            "• Cualquier pregunta que tengas 😊",
+            "/resumen — Resumen del día\n"
+            "/probar\\_recordatorio — Probar el mensaje de las 7AM\n\n"
+            "💬 *O simplemente escríbeme cualquier cosa* 😊",
             parse_mode="Markdown"
         )
-
     elif query.data == "limpiar_completadas":
         before = len(memory["tasks"])
         memory["tasks"] = [t for t in memory["tasks"] if not t.get("done")]
-        after = len(memory["tasks"])
         save_memory(memory)
-        await query.message.reply_text(f"🗑️ Eliminadas {before - after} tareas completadas.")
+        await query.message.reply_text(f"🗑️ Eliminadas {before - len(memory['tasks'])} tareas completadas.")
 
-# ─── Arranque del Bot ─────────────────────────────────────────────────────────
+# ─── Arranque ────────────────────────────────────────────────────────────────
 def main():
     if not TELEGRAM_TOKEN:
         print("❌ ERROR: Falta TELEGRAM_TOKEN")
@@ -360,7 +369,6 @@ def main():
         return
 
     print("🤖 Iniciando bot...")
-
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -368,9 +376,19 @@ def main():
     app.add_handler(CommandHandler("notas", ver_notas))
     app.add_handler(CommandHandler("habitos", ver_habitos))
     app.add_handler(CommandHandler("resumen", resumen))
+    app.add_handler(CommandHandler("probar_recordatorio", test_reminder))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
+    scheduler = AsyncIOScheduler(timezone=TIMEZONE)
+    scheduler.add_job(
+        morning_reminder,
+        CronTrigger(hour=7, minute=0, timezone=TIMEZONE),
+        args=[app],
+        id="morning_reminder"
+    )
+    scheduler.start()
+    print(f"⏰ Recordatorio programado para las 7:00 AM ({TIMEZONE})")
     print("✅ Bot activo. Ctrl+C para parar.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
